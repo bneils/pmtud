@@ -1,0 +1,178 @@
+#!/usr/bin/env bash
+
+# pmtud.sh Efficient Pathway MTU Discovery Program
+# Copyright (C) 2025  Ben Neilsen
+
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+# WARNING: REMOVING THIS COULD CAUSE A FORK BOMB
+# To kill process, remove $TMP_DIR.
+# This is a bash-defined built-in
+# aka. primary reason why this is written in bash and not sh.
+ulimit -u 1500
+
+if [ "$EUID" = 0 ]
+then
+  echo "$0: do not run me as root! Aborting."
+  exit 1
+fi
+
+TARGETS="gnu.org kernel.org debian.org"
+
+# If /tmp does not exist on your system, change it here.
+# $HOME or /dev/shm will do.
+# DO NOT SET IT TO THE ENTIRE DIRECTORY, SUCH AS /tmp OR $HOME
+TMP_DIR=/tmp/pmtud-$$
+
+# PING_WAIT should be a real > 0, but increase it if needed.
+# SPAWN_WAIT can be a real > 0 provided that R = PING_WAIT / SPAWN_WAIT <= 3
+# A higher R creates more pings with diminishing returns in execution time.
+# It is recommended to instead lower PING_WAIT.
+# Increase PING_WAIT for 3 or more TARGETS
+PING_WAIT=2
+SPAWN_WAIT=1
+
+dns() {
+  dig -4 +short "$1" | head -1
+}
+
+# measure() checks if a ping can be sent with size $1 without being fragmented
+# within $PING_WAIT seconds.
+# Pre-condition: the caller must have defined $host
+# Post-condition: file at $PING_DIR/$1 containing 0 for "no frag needed" or
+# 1 for "frag needed"
+measure() {
+  [ -d "$PING_DIR" ] && [ ! "$addr" = "" ] || exit 1
+
+  replies=$(
+  {
+    {
+      {
+        {
+          ping -4 -c 1 -w "$PING_WAIT" -M "do" "$addr" -s "$1" 2>/dev/null
+          status=$?
+          echo "$status" >&3;
+        } | grep "received" | cut -d',' -f2 | cut -d' ' -f2 >&4;
+      } 3>&1;
+    } | {
+          read -r xs
+          # clamp $? to 0 or 1, because ping has other return codes
+          [ "$xs" -ne 0 ] && xs=1
+          echo "$xs" > "$PING_DIR/$1";
+    }
+  } 4>&1)
+  # Open the file only when the commands are done
+  echo "$replies" >> "$TMP_DIR/num_pings"
+}
+
+# look() returns with code 0 if measurement of size $1 would update the
+# known MTU bounds. Doesn't include measurements waiting for a response.
+# If a measurement returned after look()'s invocation it is not included.
+# Pre-conditions:
+#  - $PING_DIR exists
+#  - $PING_DIR only has files with digit names, no whitespace
+#  - Files either contain '0' or '1'
+# Performance: O(n)
+look() {
+  cd "$PING_DIR" || exit 1
+  for filename in *
+  do
+    if [ ! -f "$filename" ]
+    then continue
+    fi
+    status=$(cat "$filename")
+    if [ "$filename" -ge "$1" ] && [ "$status" -eq 0 ]
+    then return 1
+    elif [ "$filename" -le "$1" ] && [ "$status" -ne 0 ]
+    then return 1
+    fi
+  done
+  return 0
+}
+
+# binsearch() performs binary search on the domain [$1,$2]
+# Pre-condition: two valid integers $1 and $2
+binsearch() {
+  # This is a protective measure against runaway children!
+  [ -d "$TMP_DIR" ] || return 1
+  x=$(("($1+$2)/2"))
+  if look "$x"
+  then
+    measure "$x" &
+    sleep "$SPAWN_WAIT"
+    if [ "$1" -ne "$2" ]
+    then
+      # Avoid infinite loops, by only bisecting if
+      # domain is non-zero
+      binsearch "$1" "$(("$x-1"))" &
+      binsearch "$(("$x+1"))" "$2" &
+    fi
+    wait
+  fi
+}
+
+# biggest() prints the size of the biggest ping that returned a response.
+# Pre-condition: files exist in $PING_DIR containing either 1 or 0.
+biggest() {
+  max=0
+  cd "$PING_DIR" || exit 1
+  for filename in * ; do
+    if [ ! -f "$filename" ]
+    then continue
+    fi
+    status=$(cat "$filename")
+    if [ "$status" -eq 0 ] && [ "$filename" -gt "$max" ]
+    then max="$filename"
+    fi
+  done
+  echo "$max"
+}
+
+num_pings() {
+  total=0
+  while read -r n
+  do total="$n + $total"
+  done < "$TMP_DIR/num_pings"
+  echo "$(("$total"))"
+}
+
+find_mtu() {
+  binsearch 0 1472
+  MAX_PING_PAYLOAD=$(biggest)
+  if [ "$MAX_PING_PAYLOAD" -gt 0 ]
+  then MTU=$(("$MAX_PING_PAYLOAD + 28"))
+  else MTU=0
+  fi
+  echo "$MTU $host" >> "$TMP_DIR/mtu"
+}
+
+main() {
+  for host in $TARGETS ; do
+    addr=$(dns "$host")
+    PING_DIR="$TMP_DIR"/$(echo "$host" | sha1sum | cut -d' ' -f1)
+    mkdir "$PING_DIR" || exit 1
+    find_mtu &
+  done
+  # Wait until all processes finish to print results
+  wait
+  echo "$(num_pings) replies"
+  cat "$TMP_DIR/mtu"
+}
+
+# Evaluated left-to-right, fails if these commands don't exist
+{ which dig && which ping && which sha1sum || exit 1; } > /dev/null
+
+mkdir "$TMP_DIR" || exit 1
+main
+rm -r "$TMP_DIR"
