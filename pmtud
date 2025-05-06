@@ -16,10 +16,10 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+# Bash specifics: ulimit and pipefail
+
 # WARNING: REMOVING THIS COULD CAUSE A FORK BOMB
-# To kill process, remove $TMP_DIR.
-# This is a bash-defined built-in
-# aka. primary reason why this is written in bash and not sh.
+# To kill this process, remove $TMP_DIR.
 ulimit -u 1500
 
 if [ "$EUID" = 0 ]
@@ -44,7 +44,7 @@ PING_WAIT=2
 SPAWN_WAIT=1
 
 dns() {
-  dig -4 +short "$1" | head -1
+  dig -4 +short "$1" | head -n 1
 }
 
 # measure() checks if a ping can be sent with size $1 without being fragmented
@@ -53,27 +53,17 @@ dns() {
 # Post-condition: file at $PING_DIR/$1 containing 0 for "no frag needed" or
 # 1 for "frag needed"
 measure() {
-  [ -d "$PING_DIR" ] && [ ! "$addr" = "" ] || exit 1
+  [[ -d "$PING_DIR" && "$addr" != "" ]] || exit 1
 
-  replies=$(
-  {
-    {
-      {
-        {
-          ping -4 -c 1 -w "$PING_WAIT" -M "do" "$addr" -s "$1" 2>/dev/null
-          status=$?
-          echo "$status" >&3;
-        } | grep "received" | cut -d',' -f2 | cut -d' ' -f2 >&4;
-      } 3>&1;
-    } | {
-          read -r xs
-          # clamp $? to 0 or 1, because ping has other return codes
-          [ "$xs" -ne 0 ] && xs=1
-          echo "$xs" > "$PING_DIR/$1";
-    }
-  } 4>&1)
+  # Bash-specific feature
+  set -o pipefail
+  line=$(ping -4 -c 1 -w "$PING_WAIT" -M "do" "$addr" -s "$1" 2>/dev/null |
+    grep "received" | head -n+1)
+  status=$?
+  nreplies=$(echo "$line" | cut -d',' -f2 | cut -d' ' -f2)
   # Open the file only when the commands are done
-  echo "$replies" >> "$TMP_DIR/num_pings"
+  echo "$nreplies" >> "$TMP_DIR/num_pings"
+  echo "$status" > "$PING_DIR/$1";
 }
 
 # look() returns with code 0 if measurement of size $1 would update the
@@ -92,9 +82,8 @@ look() {
     then continue
     fi
     status=$(cat "$filename")
-    if [ "$filename" -ge "$1" ] && [ "$status" -eq 0 ]
-    then return 1
-    elif [ "$filename" -le "$1" ] && [ "$status" -ne 0 ]
+    if [[ ("$filename" -ge "$1" && "$status" -eq 0) ||
+	  ("$filename" -le "$1" && "$status" -ne 0) ]]
     then return 1
     fi
   done
@@ -132,7 +121,7 @@ biggest() {
     then continue
     fi
     status=$(cat "$filename")
-    if [ "$status" -eq 0 ] && [ "$filename" -gt "$max" ]
+    if [[ "$status" -eq 0 && "$filename" -gt "$max" ]]
     then max="$filename"
     fi
   done
