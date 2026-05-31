@@ -2,20 +2,19 @@
 #include <stdlib.h>
 #include <string.h>
 #include <err.h>
+#include <time.h>
+#include <stdint.h>
 #include <unistd.h>
 #include <pthread.h>
-#include <time.h>
-#include <sys/time.h>
-#include <stdint.h>
-#include <linux/time.h>
 
 #define PING_WAIT_SEC 2
 #define SPAWN_WAIT_MS 500
 
-#define MTU 1520
+// MTU refers to the maximum size of the IP PDU / Ethernet payload.
+#define MTU 1500
 #define IP_HDR 20
 #define ICMP_HDR 8
-#define MAX_PING_PAYLOAD (MTU - IP_HDR - ICMP_HDR)
+#define MAX_ICMP_LD (MTU - IP_HDR - ICMP_HDR)
 
 #define UNKNOWN 0
 #define SUCCESS 1
@@ -26,7 +25,7 @@ typedef char status_t;
 
 struct pmtud_args {
   const char *addr;
-  status_t results[MAX_PING_PAYLOAD + 1];
+  status_t results[MAX_ICMP_LD + 1];
   int sent_no;
   int rcv_no;
   pthread_mutex_t lock;
@@ -36,7 +35,6 @@ struct ping_args {
   struct pmtud_args *m_args;
   int size;
   status_t status;
-  pthread_mutex_t status_lock;
 };
 
 struct binsearch_args {
@@ -44,6 +42,24 @@ struct binsearch_args {
   int start;
   int end;
 };
+
+void
+pmtud_args_init (struct pmtud_args *m, const char *addr)
+{
+  pthread_mutex_init (&m->lock, NULL);
+  memset (m->results, UNKNOWN, sizeof (m->results));
+  m->addr = addr;
+  m->rcv_no = 0;
+  m->sent_no = 0;
+}
+
+void
+binsearch_args_init (struct binsearch_args *b, struct pmtud_args *m, int start, int end)
+{
+  b->m_args = m;
+  b->start = start;
+  b->end = end;
+}
 
 int
 calc_mtu (struct pmtud_args *m_args)
@@ -86,10 +102,10 @@ thread_ping (void *args)
     memset (m_args->results, SUCCESS, p_args->size + 1);
   } else {
     p_args->status = FAILURE;
-    memset (&m_args->results[p_args->size], FAILURE, MAX_PING_PAYLOAD - p_args->size + 1);
+    memset (&m_args->results[p_args->size], FAILURE, MAX_ICMP_LD - p_args->size + 1);
   }
   pthread_mutex_unlock (&m_args->lock);
-  pthread_mutex_unlock (&p_args->status_lock);
+  pthread_exit (NULL);
 
   return NULL;
 }
@@ -114,46 +130,35 @@ void *
 thread_binsearch (void *args)
 {
   int mid;
-  status_t status;
-  pthread_t tid1, tid2, tid3;
+  pthread_t tid1, tid2;
   struct binsearch_args *b_args = args;
+  struct binsearch_args child_arg;
+  struct timespec time_start, time_end;
 
+  // Stop if sentinel is reached
   if (b_args->start > b_args->end)
     return NULL;
 
+  // Get midpoint of the two ping sizes
   mid = (b_args->start + b_args->end) / 2;
 
+  // Only continue if this ping's success is unknown
   if (0 != check_status (mid, b_args->m_args))
     return NULL;
 
+  // Start the ping
   struct ping_args p_args = {
     .size = mid,
     .status = UNKNOWN,
     .m_args = b_args->m_args,
-    .status_lock = PTHREAD_MUTEX_INITIALIZER,
   };
-
-  struct binsearch_args child1_args = {
-    .m_args = b_args->m_args,
-    .start = b_args->start,
-    .end = mid - 1,
-  };
-
-  struct binsearch_args child2_args = {
-    .m_args = b_args->m_args,
-    .start = mid + 1,
-    .end = b_args->end,
-  };
-
-  check (pthread_mutex_trylock, &p_args.status_lock);
   check (pthread_create, &tid1, NULL, thread_ping, &p_args);
 
-  struct timespec time_start, time_end;
-  clock_gettime(CLOCK_MONOTONIC_RAW, &time_start);
-
+  clock_gettime (CLOCK_MONOTONIC_RAW, &time_start);
+  check (pthread_join, tid1, NULL);
   if (b_args->start != b_args->end) {
-    pthread_mutex_lock (&p_args.status_lock);
-    clock_gettime(CLOCK_MONOTONIC_RAW, &time_end);
+    // Measure time for ping thread to finish
+    clock_gettime (CLOCK_MONOTONIC_RAW, &time_end);
 
     uint64_t delta_ms = (time_end.tv_sec - time_start.tv_sec) * 1000
       + (time_end.tv_nsec - time_start.tv_nsec) / 1000 / 1000;
@@ -165,17 +170,38 @@ thread_binsearch (void *args)
         .tv_nsec = wait_ms % 1000 * 1000 * 1000,
         .tv_sec = wait_ms / 1000,
       };
-
       check (nanosleep, &duration, NULL);
     }
 
-    check (pthread_create, &tid2, NULL, thread_binsearch, &child1_args);
-    check (pthread_create, &tid3, NULL, thread_binsearch, &child2_args);
+    // Start a new branched search
+    if (p_args.status == FAILURE)
+      binsearch_args_init (&child_arg, b_args->m_args, b_args->start, mid - 1);
+    else
+      binsearch_args_init (&child_arg, b_args->m_args, mid + 1, b_args->end);
+
+    check (pthread_create, &tid2, NULL, thread_binsearch, &child_arg);
     check (pthread_join, tid2, NULL);
-    check (pthread_join, tid3, NULL);
   }
 
+  return NULL;
+}
+
+/* Pathway MTU discovery thread. Employs strategy to get MTU. */
+void *
+thread_pmtud (void *args)
+{
+  struct pmtud_args *m_args = args;
+  pthread_t tid1, tid2;
+  struct binsearch_args b_args1, b_args2;
+  // Two searches are created: one is the unlikely worst-case (where it's not 1500)
+  // and the other is the likely best-case (where it's 1500)
+  binsearch_args_init (&b_args1, m_args, 0, MAX_ICMP_LD);
+  binsearch_args_init (&b_args2, m_args, MAX_ICMP_LD, MAX_ICMP_LD);
+
+  check (pthread_create, &tid1, NULL, thread_binsearch, &b_args1);
+  check (pthread_create, &tid2, NULL, thread_binsearch, &b_args2);
   check (pthread_join, tid1, NULL);
+  check (pthread_join, tid2, NULL);
   return NULL;
 }
 
@@ -184,38 +210,30 @@ main (void)
 {
   char *addrs[] = {
     "209.51.188.116", // gnu.org
-    "1.1.1.1",
+    "172.105.4.254", // kernel.org
+    "151.101.194.132", // debian.org
   };
 
   const int len = sizeof (addrs) / sizeof (*addrs);
+  int sent_total, rcv_total;
   pthread_t tids[len];
   struct pmtud_args m_args[len];
-  struct binsearch_args b_args[len];
+  sent_total = 0;
+  rcv_total = 0;
 
   // Start all the MTU searches
   for (int i = 0; i < len; ++i) {
-    pthread_mutex_init (&m_args[i].lock, NULL);
-    memset (m_args[i].results, UNKNOWN, sizeof (m_args[i].results));
-    m_args[i].addr = addrs[i];
-    m_args[i].rcv_no = 0;
-    m_args[i].sent_no = 0;
-    b_args[i].m_args = &m_args[i];
-    b_args[i].start = 0;
-    b_args[i].end = MAX_PING_PAYLOAD;
-    
-    check (pthread_create, &tids[i], NULL, thread_binsearch, &b_args[i]);
+    pmtud_args_init (&m_args[i], addrs[i]);
+    check (pthread_create, &tids[i], NULL, thread_pmtud, &m_args[i]);
   }
 
-  // Wait for all the MTU searches to finish
-  int sent_total, rcv_total;
-  sent_total = rcv_total = 0;
-
+  // Wait for all the MTU searches to finish and print statistics
   for (int i = 0; i < len; ++i) {
     check (pthread_join, tids[i], NULL);
     struct pmtud_args *a = &m_args[i];
-    printf ("%-15s: %d bytes (%d sent, %d received)\n", a->addr, calc_mtu (a), a->sent_no, a->rcv_no);
+    printf ("%-15s %d bytes (%d sent, %d received)\n", a->addr, calc_mtu (a), a->sent_no, a->rcv_no);
     sent_total += a->sent_no;
     rcv_total += a->rcv_no;
   }
-  printf("total %d sent %d received\n", sent_total, rcv_total);
+  printf ("total %d sent %d received\n", sent_total, rcv_total);
 }
